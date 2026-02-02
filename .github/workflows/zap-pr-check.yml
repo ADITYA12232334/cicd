@@ -1,0 +1,212 @@
+name: ZAP Security Scan (PR Check)
+
+# Trigger on pull requests to main branch
+on:
+  pull_request:
+    branches:
+      - main
+
+# Required permissions for posting comments and creating checks
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+jobs:
+  security-scan:
+    name: Run ZAP Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      # ========================================================================
+      # STEP 1: Checkout Code
+      # ========================================================================
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ========================================================================
+      # STEP 2: Set up Python
+      # ========================================================================
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      # ========================================================================
+      # STEP 3: Install Dependencies
+      # ========================================================================
+      - name: Install dependencies
+        run: |
+          pip install python-owasp-zap-v2.4 requests python-dotenv colorama
+
+      # ========================================================================
+      # STEP 4: Start ZAP Container
+      # ========================================================================
+      - name: Start ZAP
+        run: |
+          docker run -d \
+            -p 8080:8080 \
+            -v $(pwd):/zap/wrk/:rw \
+            --name zap \
+            zaproxy/zap-bare \
+            zap.sh -daemon \
+            -host 0.0.0.0 \
+            -port 8080 \
+            -config api.disablekey=true \
+            -config 'api.addrs.addr.name=.*' \
+            -config api.addrs.addr.regex=true
+
+      # ========================================================================
+      # STEP 5: Wait for ZAP to be Ready
+      # ========================================================================
+      - name: Wait for ZAP
+        run: |
+          echo "Waiting for ZAP to start..."
+          timeout 120 bash -c 'until curl -f http://localhost:8080/JSON/core/view/version/; do sleep 2; done'
+          echo "ZAP is ready!"
+
+      # ========================================================================
+      # STEP 6: Run Security Scan
+      # ========================================================================
+      - name: Run security scan
+        env:
+          ZAP_TARGET_URL: ${{ secrets.ZAP_TARGET_URL || 'http://testphp.vulnweb.com' }}
+          ZAP_SCAN_TYPE: quick
+          ZAP_MAX_HIGH: 0
+          ZAP_MAX_MEDIUM: 999
+          ZAP_MAX_LOW: 999
+          ZAP_HOST: localhost
+          ZAP_PORT: 8080
+          ZAP_REPORT_DIR: ./reports
+        run: |
+          echo "Starting ZAP security scan..."
+          echo "Target: $ZAP_TARGET_URL"
+          echo "Scan Type: $ZAP_SCAN_TYPE"
+          python step2_configurable_scan.py
+
+      # ========================================================================
+      # STEP 7: Upload Reports as Artifacts
+      # ========================================================================
+      - name: Upload scan reports
+        uses: actions/upload-artifact@v4
+        if: always()  # Upload even if scan fails
+        with:
+          name: zap-reports-pr-${{ github.event.pull_request.number }}
+          path: reports/
+          retention-days: 30
+
+      # ========================================================================
+      # STEP 8: Generate Summary for PR Comment
+      # ========================================================================
+      - name: Generate summary
+        if: always()
+        id: summary
+        run: |
+          # Get the latest summary file
+          SUMMARY_FILE=$(ls -t reports/zap_summary_*.json | head -1)
+          
+          if [ -f "$SUMMARY_FILE" ]; then
+            # Extract data using Python
+            python3 << 'EOF'
+          import json
+          import os
+          
+          with open(os.environ['SUMMARY_FILE']) as f:
+              data = json.load(f)
+          
+          high = data['risk_counts']['High']
+          medium = data['risk_counts']['Medium']
+          low = data['risk_counts']['Low']
+          total = data['total_alerts']
+          passed = data['passed']
+          
+          # Set outputs for next step
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"high={high}\n")
+              f.write(f"medium={medium}\n")
+              f.write(f"low={low}\n")
+              f.write(f"total={total}\n")
+              f.write(f"passed={'✅ PASSED' if passed else '❌ FAILED'}\n")
+          EOF
+          fi
+        env:
+          SUMMARY_FILE: ${{ env.SUMMARY_FILE }}
+
+      # ========================================================================
+      # STEP 9: Post PR Comment with Results
+      # ========================================================================
+      - name: Post PR comment
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            // Find latest summary file
+            const summaryFiles = fs.readdirSync('reports')
+              .filter(f => f.startsWith('zap_summary_'))
+              .sort()
+              .reverse();
+            
+            if (summaryFiles.length === 0) {
+              console.log('No summary file found');
+              return;
+            }
+            
+            const summaryPath = `reports/${summaryFiles[0]}`;
+            const summary = JSON.parse(fs.readFileSync(summaryPath, 'utf8'));
+            
+            const high = summary.risk_counts.High;
+            const medium = summary.risk_counts.Medium;
+            const low = summary.risk_counts.Low;
+            const total = summary.total_alerts;
+            const passed = summary.passed;
+            
+            // Build comment body
+            let comment = `## 🔒 ZAP Security Scan Results\n\n`;
+            comment += `**Scan Type:** Quick (PR Check)\n`;
+            comment += `**Target:** \`${summary.target_url}\`\n`;
+            comment += `**Status:** ${passed ? '✅ Passed' : '❌ Failed'}\n\n`;
+            
+            comment += `### Summary\n`;
+            comment += `- 🔴 High: **${high}** (max: 0) ${high === 0 ? '✅' : '❌'}\n`;
+            comment += `- 🟠 Medium: **${medium}** (max: 999) ✅\n`;
+            comment += `- 🟡 Low: **${low}** (max: 999) ✅\n`;
+            comment += `- **Total Alerts:** ${total}\n\n`;
+            
+            // Add high-risk alerts if any
+            if (summary.high_risk_alerts && summary.high_risk_alerts.length > 0) {
+              comment += `### ⚠️ High Risk Vulnerabilities\n\n`;
+              summary.high_risk_alerts.slice(0, 3).forEach((alert, i) => {
+                comment += `${i + 1}. **${alert.name}**\n`;
+                comment += `   - URL: \`${alert.url}\`\n`;
+                comment += `   - ${alert.description.substring(0, 100)}...\n\n`;
+              });
+              
+              if (summary.high_risk_alerts.length > 3) {
+                comment += `_...and ${summary.high_risk_alerts.length - 3} more high-risk issues_\n\n`;
+              }
+            } else {
+              comment += `### ✅ No High Risk Vulnerabilities Found!\n\n`;
+            }
+            
+            comment += `---\n`;
+            comment += `📊 [View Full Reports in Artifacts](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})\n`;
+            
+            // Post comment
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
+
+      # ========================================================================
+      # STEP 10: Clean Up
+      # ========================================================================
+      - name: Stop ZAP
+        if: always()
+        run: |
+          docker stop zap || true
+          docker rm zap || true
